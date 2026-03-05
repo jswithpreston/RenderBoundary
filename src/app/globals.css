@@ -1,0 +1,92 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-bg: 255 255 255;
+    --color-fg: 17 24 39;
+    --color-muted: 107 114 128;
+    --color-border: 229 231 235;
+    --color-accent: 37 99 235;
+    --color-surface: 249 250 251;
+  }
+
+  .dark {
+    --color-bg: 10 10 10;
+    --color-fg: 237 237 237;
+    --color-muted: 156 163 175;
+    --color-border: 38 38 38;
+    --color-accent: 96 165 250;
+    --color-surface: 23 23 23;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background-color: rgb(var(--color-bg));
+    color: rgb(var(--color-fg));
+  }
+
+  ::selection {
+    background-color: rgb(var(--color-accent) / 0.2);
+  }
+}
+
+/* Code block styling — works with rehype-pretty-code */
+figure[data-rehype-pretty-code-figure] {
+  @apply relative my-6;
+}
+
+figure[data-rehype-pretty-code-figure] pre {
+  @apply overflow-x-auto rounded-lg border border-neutral-200 bg-neutral-950 px-0 py-4 text-sm leading-relaxed dark:border-neutral-800;
+}
+
+figure[data-rehype-pretty-code-figure] code {
+  @apply grid;
+  counter-reset: line;
+}
+
+figure[data-rehype-pretty-code-figure] [data-line] {
+  @apply border-l-2 border-transparent px-5;
+}
+
+figure[data-rehype-pretty-code-figure] [data-highlighted-line] {
+  @apply border-l-2 border-blue-400 bg-blue-500/10;
+}
+
+figure[data-rehype-pretty-code-figure] [data-line-numbers] [data-line]::before {
+  counter-increment: line;
+  content: counter(line);
+  @apply mr-6 inline-block w-4 text-right text-neutral-500;
+}
+
+/* Inline code within prose */
+.prose :where(code):not(:where(pre code)) {
+  @apply rounded bg-neutral-100 px-1.5 py-0.5 text-[0.875em] font-normal text-neutral-800 dark:bg-neutral-800 dark:text-neutral-200;
+}
+
+/* Title bar for code blocks */
+figure[data-rehype-pretty-code-figure] figcaption[data-rehype-pretty-code-title] {
+  @apply rounded-t-lg border border-b-0 border-neutral-200 bg-neutral-900 px-5 py-2.5 text-xs text-neutral-400 dark:border-neutral-800;
+}
+
+figure[data-rehype-pretty-code-figure] figcaption[data-rehype-pretty-code-title] + pre {
+  @apply rounded-t-none;
+}
+
+/* Scrollbar styling */
+pre::-webkit-scrollbar {
+  height: 6px;
+}
+pre::-webkit-scrollbar-track {
+  background: transparent;
+}
+pre::-webkit-scrollbar-thumb {
+  background: rgb(var(--color-muted) / 0.3);
+  border-radius: 3px;
+}

@@ -1,0 +1,184 @@
+---
+title: "TypeScript Conditional Types Demystified"
+description: "How conditional types actually work — distributivity, inference with infer, and real-world patterns you'll use in production."
+date: "2026-01-28"
+tags: ["typescript", "type-system"]
+---
+
+Conditional types are the backbone of advanced TypeScript. They look intimidating, but they follow a small set of rules. Once you internalize those rules, you can read (and write) any type-level computation.
+
+## The basics
+
+A conditional type follows the syntax:
+
+```typescript
+type Result = T extends U ? X : Y;
+```
+
+If `T` is assignable to `U`, the type resolves to `X`. Otherwise, `Y`. Straightforward.
+
+```typescript
+type IsString<T> = T extends string ? true : false;
+
+type A = IsString<"hello">; // true
+type B = IsString<42>;      // false
+```
+
+## Distributivity — the key insight
+
+Here's where most people lose the thread. When you pass a **union type** to a conditional type, it **distributes** over each member:
+
+```typescript
+type IsString<T> = T extends string ? true : false;
+
+type C = IsString<string | number>;
+// Distributes to: IsString<string> | IsString<number>
+// Resolves to:    true | false
+// Which is:       boolean
+```
+
+This isn't special-cased. It's a fundamental behavior: conditional types distribute over naked type parameters. "Naked" means the type parameter appears directly, not wrapped in another type.
+
+To **prevent** distribution, wrap both sides in a tuple:
+
+```typescript
+type IsStringStrict<T> = [T] extends [string] ? true : false;
+
+type D = IsStringStrict<string | number>; // false (no distribution)
+```
+
+This is critical for writing correct utility types. If you don't understand distributivity, you'll write types that silently produce wrong results on unions.
+
+## The `infer` keyword
+
+`infer` lets you extract types from within a conditional:
+
+```typescript
+type ReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
+
+type E = ReturnType<() => string>;         // string
+type F = ReturnType<(x: number) => void>;  // void
+```
+
+`infer R` creates a type variable `R` that TypeScript fills in by pattern-matching `T` against the function signature. You can use `infer` anywhere in the extends clause:
+
+```typescript
+// Extract the element type of an array
+type ElementOf<T> = T extends (infer E)[] ? E : never;
+
+type G = ElementOf<string[]>;   // string
+type H = ElementOf<number[]>;   // number
+
+// Extract the resolved type of a Promise
+type Awaited<T> = T extends Promise<infer U> ? Awaited<U> : T;
+
+type I = Awaited<Promise<Promise<string>>>; // string (recursive!)
+```
+
+## Real-world patterns
+
+### Deep partial
+
+Make every property optional, recursively:
+
+```typescript
+type DeepPartial<T> = T extends object
+  ? { [K in keyof T]?: DeepPartial<T[K]> }
+  : T;
+
+interface Config {
+  db: {
+    host: string;
+    port: number;
+    ssl: { cert: string; key: string };
+  };
+  cache: { ttl: number };
+}
+
+type PartialConfig = DeepPartial<Config>;
+// Every nested property is now optional
+```
+
+### Extract route params
+
+Parse URL pattern strings into typed params:
+
+```typescript
+type ExtractParams<T extends string> =
+  T extends `${string}:${infer Param}/${infer Rest}`
+    ? { [K in Param | keyof ExtractParams<Rest>]: string }
+    : T extends `${string}:${infer Param}`
+      ? { [K in Param]: string }
+      : {};
+
+type Params = ExtractParams<"/blog/:slug/comments/:commentId">;
+// { slug: string; commentId: string }
+```
+
+This is template literal types combined with conditional types. The compiler pattern-matches the string and recursively extracts parameters.
+
+### Discriminated union handlers
+
+Type-safe event handlers from a discriminated union:
+
+```typescript
+type Events =
+  | { type: "click"; x: number; y: number }
+  | { type: "keydown"; key: string }
+  | { type: "resize"; width: number; height: number };
+
+type EventHandler<T extends Events["type"]> = (
+  event: Extract<Events, { type: T }>
+) => void;
+
+const handleClick: EventHandler<"click"> = (event) => {
+  // event is { type: "click"; x: number; y: number }
+  console.log(event.x, event.y);
+};
+```
+
+`Extract` is itself a conditional type: `type Extract<T, U> = T extends U ? T : never`. Distributivity does the work — each union member is tested against `{ type: T }`, and only the matching member survives.
+
+## Performance considerations
+
+Conditional types can cause slow compilation if you're not careful:
+
+1. **Deeply recursive types** hit the recursion limit (default ~50 levels). Use tail-recursive patterns where possible.
+2. **Wide unions** (100+ members) distributed over conditional types generate enormous intermediate types.
+3. **Unnecessary complexity** — if a mapped type or intersection achieves the same result, prefer it. Conditional types are powerful but expensive.
+
+```typescript
+// Prefer this (mapped type)
+type Readonly<T> = { readonly [K in keyof T]: T[K] };
+
+// Over this (conditional + mapped, unnecessarily complex)
+type Readonly2<T> = T extends object
+  ? { readonly [K in keyof T]: T[K] }
+  : T;
+```
+
+## The compiler's perspective
+
+TypeScript evaluates conditional types lazily. When the type parameter is unresolved (generic), the conditional type remains **deferred**:
+
+```typescript
+function example<T>(value: T) {
+  type X = T extends string ? "yes" : "no";
+  // X is NOT resolved here — it stays as the conditional type
+  // until T is instantiated with a concrete type
+}
+```
+
+This means you can't use deferred conditional types in positions that require a concrete type. The compiler can't narrow `X` based on runtime checks — the type-level and value-level control flows are separate.
+
+Understanding this distinction between **eager** (concrete type arguments) and **deferred** (generic type arguments) evaluation is essential for debugging "type is not assignable" errors in generic functions.
+
+## Summary
+
+Three rules cover 90% of conditional type behavior:
+
+1. `T extends U ? X : Y` — basic pattern matching on types
+2. Unions distribute over naked type parameters (wrap in tuples to prevent)
+3. `infer` extracts types by pattern matching inside the extends clause
+
+Everything else — template literal parsing, recursive types, mapped conditional combinations — is composition of these three primitives.
