@@ -1,0 +1,152 @@
+---
+title: "Building Church Discovery with Region Filters in React Native"
+description: "How Faith Fellows implements a searchable, filterable church directory with region-based tabs, follow actions, and real-time search — all without a search backend."
+date: "2026-03-19"
+tags: ["react-native", "search", "ux", "ui"]
+---
+
+Discovery is the loneliest screen to design. Everything else in the app assumes the user already knows what they want — they're reading a sermon they followed, managing a church they run, reviewing a submission they received. The Discover screen is for the user who just opened the app and doesn't know where to start.
+
+Getting that screen wrong means people never find communities that would matter to them. Getting it right — fast, regional, forgiving of partial input — is the difference between an app people use and one they delete after a week.
+
+Faith Fellows does this entirely client-side, and it's faster than you'd expect. Here's the design.
+
+## What the Screen Has to Do
+
+Three things, simultaneously: search by name, filter by region, and let users follow a church without leaving the list. Every UI pattern that handles "search + filter + action" gets unwieldy fast if the state isn't designed carefully upfront.
+
+The solution is one derived result set that both filters compose into:
+
+```tsx
+const [query, setQuery] = useState("");
+const [region, setRegion] = useState("All");
+
+const visible = churches
+  .filter((c) => c.status === "approved")
+  .filter((c) => region === "All" || c.region === region)
+  .filter((c) => c.name.toLowerCase().includes(query.toLowerCase()));
+```
+
+This runs on every render. With seed data, that's fine. The important thing is that `visible` is the single source of truth for what the list shows — changing `query` or `region` re-derives it immediately, with no extra state, no syncing, no bugs where the filter and the search get out of step with each other.
+
+## Region Tabs
+
+Uganda's church communities are geographically clustered. A member in Gulu is unlikely to attend a church in Kampala. The region filter makes the list immediately relevant:
+
+```tsx
+const REGIONS = ["All", "Near", "Lira", "Gulu", "KLA"];
+```
+
+The horizontal tab row is a `ScrollView` with `horizontal` and `showsHorizontalScrollIndicator={false}`. Simple TouchableOpacity components, active state styled with a different background:
+
+```tsx
+<ScrollView horizontal showsHorizontalScrollIndicator={false} style={s.tabRow}>
+  {REGIONS.map((r) => (
+    <TouchableOpacity
+      key={r}
+      style={[s.tab, region === r && s.tabActive]}
+      onPress={() => setRegion(r)}
+    >
+      <Text style={[s.tabText, region === r && s.tabTextActive]}>{r}</Text>
+    </TouchableOpacity>
+  ))}
+</ScrollView>
+```
+
+"Near" is a placeholder. When `expo-location` is integrated, it resolves to the user's current region automatically. Until then, tapping Near returns the full list — which is honest. A placeholder that shows nothing is more confusing than a placeholder that does something reasonable.
+
+## ChurchCard: Data Down, Actions Up
+
+`src/components/shared/ChurchCard.tsx` is a pure presentational component. It receives data and callbacks — it owns nothing:
+
+```tsx
+interface ChurchCardProps {
+  church: Church;
+  following: boolean;
+  onFollow: () => void;
+  onPress: () => void;
+}
+```
+
+The Follow button doesn't navigate. It calls `onFollow`. The card itself doesn't call `followChurch` from context — the parent screen does. This separation matters because `ChurchCard` appears in at least three places in the app (the discover list, the home feed recommendations, and the church detail screen's related section), and each context handles the follow action slightly differently.
+
+```tsx
+// In discover.tsx
+<ChurchCard
+  church={c}
+  following={user.following.includes(c.id)}
+  onFollow={() => followChurch(user.id, c.id)}
+  onPress={() => router.push(`/(user)/church-detail?id=${c.id}`)}
+/>
+```
+
+The parent wires up the logic. The component just renders. This is a rule worth following consistently — components that are "almost dumb" are the ones that cause subtle bugs when reused.
+
+## FlatList, Not ScrollView
+
+The discover list uses `FlatList` rather than `ScrollView` + `map`:
+
+```tsx
+<FlatList
+  data={visible}
+  keyExtractor={(item) => item.id}
+  renderItem={({ item }) => (
+    <ChurchCard
+      church={item}
+      following={user.following.includes(item.id)}
+      onFollow={() => followChurch(user.id, item.id)}
+      onPress={() => router.push(`/(user)/church-detail?id=${item.id}`)}
+    />
+  )}
+  ListEmptyComponent={
+    <Text style={s.empty}>No churches found for "{query}"</Text>
+  }
+/>
+```
+
+At 11 churches this makes no difference. At 500 it makes every difference — `FlatList` virtualises the list, only rendering items near the viewport and recycling off-screen cells. Build with `FlatList` once, avoid the migration when the data grows.
+
+`ListEmptyComponent` is easy to skip but worth adding. When a user types "Kamp" and sees a blank screen, they don't know if the search is working. When they see "No churches found for 'Kamp'", they understand immediately and can adjust. Small copy, significant UX.
+
+## Debouncing for the Backend Migration
+
+Right now, `setQuery` fires on every keystroke and the filter runs synchronously. That's fine. But when this moves to a Supabase `ilike` query, every keystroke fires a network request — at 60 WPM that's a character every 250ms, or 4 requests per second while someone types a church name.
+
+Add the debounce now, before it matters:
+
+```tsx
+const debounceRef = useRef<ReturnType<typeof setTimeout>>();
+
+const handleSearch = (text: string) => {
+  if (debounceRef.current) clearTimeout(debounceRef.current);
+  debounceRef.current = setTimeout(() => setQuery(text), 300);
+};
+```
+
+The input calls `handleSearch` instead of `setQuery`. The query only updates 300ms after the last keystroke. The user types freely; the search runs when they pause. With client-side filtering, this has no visible effect. With a network call, it reduces query volume by roughly 70%. You write it once, and it survives the migration.
+
+## Full-Text Search at Scale
+
+When the church directory grows, `includes()` substring matching isn't good enough. A misspelling returns nothing. Common words swamp the results. Supabase's full-text search handles this with a generated `tsvector` column and a GIN index:
+
+```sql
+alter table churches
+  add column fts tsvector
+  generated always as (to_tsvector('english', name || ' ' || coalesce(bio, ''))) stored;
+
+create index churches_fts_idx on churches using gin(fts);
+```
+
+The client query becomes:
+
+```ts
+supabase
+  .from("churches")
+  .select()
+  .textSearch("fts", query)
+  .eq("region", region !== "All" ? region : undefined)
+```
+
+The component never changes. The state model never changes. The user experience improves automatically — typo tolerance, ranked results, partial word matching. This is what it looks like when the component layer is designed independently of the data layer.
+
+Build the UI against state. Let the data source be a detail.

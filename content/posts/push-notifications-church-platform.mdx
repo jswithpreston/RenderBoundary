@@ -1,0 +1,199 @@
+---
+title: "Push Notifications for a Church Platform with Expo and Supabase"
+description: "How to wire up church-to-member push notifications in Faith Fellows using Expo Notifications, Supabase Edge Functions, and a notification inbox UI."
+date: "2026-03-19"
+tags: ["expo", "notifications", "supabase", "backend"]
+---
+
+Faith Fellows already has a notification inbox. The Alerts tab renders a list of unread and read notifications, grouped by type, with a badge count on the tab icon. It's polished, it works, and right now it's completely silent — because no real notifications are ever sent. A church can publish a sermon to a thousand followers and not a single phone buzzes.
+
+That's the gap between a prototype and a product. This post closes it: token registration, the Supabase schema, the Edge Function that fires on every post publish, and the Realtime subscription that updates the inbox without a pull-to-refresh. By the end, when a church hits Publish, real people get a real ping.
+
+## Two Types of Notifications
+
+Faith Fellows has two distinct notification categories, and the distinction matters for how they're sent:
+
+1. **Church notifications** — triggered when a followed church publishes new content. Targeted only to that church's followers.
+2. **System notifications** — platform-wide announcements from the super admin. Sent to all users.
+
+Both share the same `AppNotification` shape:
+
+```ts
+interface AppNotification {
+  id: string;
+  title: string;
+  body: string;
+  churchId: string;
+  postId?: string;
+  ts: number;
+  read: boolean;
+}
+```
+
+The delivery mechanism differs. Church notifications need a follower lookup before sending. System notifications are a broadcast. Same schema, different fan-out logic.
+
+## Step One: Register Device Tokens
+
+Before any notification can be sent, the app needs to know which device token belongs to which user. This happens at login:
+
+```ts
+import * as Notifications from "expo-notifications";
+import Constants from "expo-constants";
+
+async function registerPushToken(userId: string) {
+  const { status } = await Notifications.requestPermissionsAsync();
+  if (status !== "granted") return;
+
+  const token = await Notifications.getExpoPushTokenAsync({
+    projectId: Constants.expoConfig?.extra?.eas?.projectId,
+  });
+
+  await supabase
+    .from("push_tokens")
+    .upsert({ user_id: userId, token: token.data }, { onConflict: "user_id" });
+}
+```
+
+One token per user, updated on every login (users switch devices; tokens change):
+
+```sql
+create table push_tokens (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  token text not null,
+  updated_at timestamptz default now()
+);
+```
+
+The `upsert` with `onConflict: "user_id"` means the table stays clean — one row per user, always current. No stale tokens building up, no duplicates to filter later.
+
+## Step Two: Fire on Publish
+
+When a church publishes a post, a Supabase Database Webhook fires a Deno Edge Function. The function is responsible for two things: sending push notifications to followers' devices, and creating inbox rows so the notifications appear in-app even if the push was dismissed:
+
+```ts
+// supabase/functions/notify-followers/index.ts
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+Deno.serve(async (req) => {
+  const { record } = await req.json(); // new post record
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  // Get all followers of this church
+  const { data: followers } = await supabase
+    .from("follows")
+    .select("user_id")
+    .eq("church_id", record.church_id);
+
+  if (!followers?.length) return new Response("ok");
+
+  const userIds = followers.map((f) => f.user_id);
+
+  // Get their push tokens
+  const { data: tokens } = await supabase
+    .from("push_tokens")
+    .select("token")
+    .in("user_id", userIds);
+
+  if (!tokens?.length) return new Response("ok");
+
+  // Send via Expo Push API
+  const messages = tokens.map((t) => ({
+    to: t.token,
+    title: record.title,
+    body: record.body?.slice(0, 100),
+    data: { postId: record.id, churchId: record.church_id },
+  }));
+
+  await fetch("https://exp.host/--/api/v2/push/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(messages),
+  });
+
+  // Insert notification rows for the inbox
+  const notifications = followers.map((f) => ({
+    user_id: f.user_id,
+    title: record.title,
+    body: record.body?.slice(0, 200),
+    church_id: record.church_id,
+    post_id: record.id,
+    read: false,
+  }));
+
+  await supabase.from("notifications").insert(notifications);
+
+  return new Response("ok");
+});
+```
+
+The two-step pattern — push to device AND write to database — is important. Push notifications are not reliable. Users disable them. Devices are offline. iOS throttles delivery. The inbox row is the durable fallback: it's always there when the user opens the app, regardless of whether the push got through.
+
+## Step Three: The Inbox Goes Live
+
+The notification inbox in `app/(user)/(tabs)/library.tsx` currently reads from `AppContext`. The Supabase migration is a direct swap:
+
+```ts
+// Current (mock)
+const { notifications, markNotificationsRead } = useAppContext();
+
+// After migration
+const { data: notifications } = await supabase
+  .from("notifications")
+  .select("*")
+  .eq("user_id", userId)
+  .order("created_at", { ascending: false });
+```
+
+But fetching on mount isn't enough — if a notification arrives while the app is open, the inbox should update immediately. Supabase Realtime handles this with a Postgres change subscription:
+
+```ts
+useEffect(() => {
+  const channel = supabase
+    .channel("notifications")
+    .on(
+      "postgres_changes",
+      {
+        event: "INSERT",
+        schema: "public",
+        table: "notifications",
+        filter: `user_id=eq.${userId}`
+      },
+      (payload) => setNotifications((prev) => [payload.new, ...prev])
+    )
+    .subscribe();
+
+  return () => supabase.removeChannel(channel);
+}, [userId]);
+```
+
+New notification row written by the Edge Function → Realtime broadcasts the INSERT → the subscriber prepends it to local state → the inbox updates in real-time, no refresh needed. The badge count updates too, because it's derived from the same array:
+
+```tsx
+const unread = notifications.filter((n) => !n.read).length;
+tabBarBadge: unread > 0 ? unread : undefined,
+```
+
+## Marking Read
+
+Tapping into the inbox or opening a notification should clear the badge. A bulk update covers all unread rows at once:
+
+```ts
+const markAllRead = async () => {
+  await supabase
+    .from("notifications")
+    .update({ read: true })
+    .eq("user_id", userId)
+    .eq("read", false);
+};
+```
+
+Optimistically update local state at the same time so the badge clears immediately, without waiting for the round-trip.
+
+## The Church Admin Side
+
+The church portal's Engage tab has a "Send Notification" quick action — a manual push to all followers, separate from post publishing. The implementation is the same Edge Function pattern, but triggered by a direct API call rather than a database webhook. The church types a title and message, taps Send, and the function fans out to all followers.
+
+This is the moment the prototype becomes a platform. Not when the UI looks right. Not when the data model is clean. When a pastor in Lira taps Publish and a member in Kampala's phone buzzes — that's when it's real.

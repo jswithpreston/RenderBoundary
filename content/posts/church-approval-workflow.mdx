@@ -1,0 +1,135 @@
+---
+title: "Designing a Church Approval Workflow for a Multi-Tenant Platform"
+description: "How Faith Fellows implements a pending → approved → rejected state machine for church onboarding, from registration through admin review to live status."
+date: "2026-03-19"
+tags: ["ux", "workflow", "admin", "react-native"]
+---
+
+Open registration is a shortcut that looks cheap at first and costs you later. Let anyone sign up, start publishing, and build a following — and you'll spend the next year moderating spam churches, fake congregations, and bad actors who figured out your platform reaches people in an emotionally trusting headspace. Faith is not a domain where you want to move fast and fix trust problems later.
+
+Faith Fellows takes the opposite approach: a church registers, a super admin reviews the submission, and the church only goes live once approved. This is a three-state machine — `pending`, `approved`, `rejected` — and getting the transitions right matters more than the UI around them. Here's how it works and why each design decision is load-bearing.
+
+## The State Machine First
+
+Before any UI, the type:
+
+```ts
+type ChurchStatus = "approved" | "pending" | "rejected";
+```
+
+Three states. The transitions are:
+- Registration → `pending` (automatic)
+- `pending` → `approved` (admin action)
+- `pending` → `rejected` (admin action)
+- `rejected` → `pending` (re-application, not yet implemented but the model supports it)
+
+There's no `active`/`inactive` toggle, no soft-delete, no archived state — those are scope creep. The machine is as small as it needs to be, and every downstream behavior in the app derives from it.
+
+## Registration Always Creates Pending
+
+When a church completes signup, `registerChurch()` sets `status: "pending"` unconditionally:
+
+```ts
+const registerChurch = (data: ChurchRegistrationData) => {
+  const newChurch: Church = {
+    id: `ch${Date.now()}`,
+    ...data,
+    status: "pending",
+    members: 0,
+    posts: [],
+  };
+  setChurches((prev) => [...prev, newChurch]);
+};
+```
+
+The church is in the system. They can log in. But `status: "pending"` gates everything downstream — content publishing, discovery, member follows. Pending is not a waiting room. It's a state with real constraints that the whole app enforces.
+
+## The Pending Screen Is a UX Feature
+
+After registration, the church portal's `_layout.tsx` checks the church's status before it renders anything:
+
+```tsx
+// app/(church)/_layout.tsx
+if (authed.status === "pending") {
+  return <Redirect href="/(auth)/church-pending" />;
+}
+```
+
+This redirect fires before any tab bar or dashboard renders. The church sees exactly one screen: a holding page with their name, a `PENDING REVIEW` badge, and a brief message explaining the process.
+
+That screen is intentionally minimal, but it's not an afterthought — it's the first thing a church sees after registering, and it sets the tone for the platform. A well-designed pending screen communicates: *we got your registration, we take it seriously, here's what happens next.* A missing or broken pending screen communicates the opposite. There's no navigation deeper into the app from here. The wall is the feature.
+
+## The Admin Review Queue
+
+The super admin's dashboard surfaces pending churches at the top as a priority list:
+
+```tsx
+const pending = churches.filter((c) => c.status === "pending");
+```
+
+Each pending church card shows enough context to make an informed decision: name, denomination, region, pastor name and contact email, and registration date. Approve and Reject buttons sit next to each other. Because those two buttons are permanent and irreversible (for now), both trigger an `Alert` confirmation before committing:
+
+```tsx
+const handleApprove = (id: string) => {
+  Alert.alert(
+    "Approve Church",
+    "This church will go live and appear to all users.",
+    [
+      { text: "Cancel", style: "cancel" },
+      { text: "Approve", onPress: () => approveChurch(id) },
+    ]
+  );
+};
+```
+
+The confirmation isn't defensive UI for the sake of it — it's a prompt for the admin to pause and read what they're about to do. The Reject button has an identical pattern. One accidental approval of a fake church undermines the trust the platform is built on.
+
+## The Status Mutations
+
+The actual state changes are straightforward:
+
+```ts
+const approveChurch = (id: string) => {
+  setChurches((prev) =>
+    prev.map((c) => (c.id === id ? { ...c, status: "approved" } : c))
+  );
+};
+
+const rejectChurch = (id: string) => {
+  setChurches((prev) =>
+    prev.map((c) => (c.id === id ? { ...c, status: "rejected" } : c))
+  );
+};
+```
+
+Because the church portal's `_layout.tsx` reads `authed.status` reactively, a church that's approved while their session is active will see their portal unlock without needing to log out and back in. The state update propagates through context, the layout re-renders, and the portal opens. This is one of those moments where a well-structured context pays for itself visibly.
+
+## Approved-Only Everywhere
+
+The most important invariant in the system: pending and rejected churches are invisible to regular users. This is enforced at every place churches surface in the app — the feed, the discovery screen, the recommended list, search results:
+
+```tsx
+const liveChurches = churches.filter((c) => c.status === "approved");
+```
+
+One consistent check. No special cases, no "unless they have at least one post" exceptions, no toggle to override it per-church. If the status is not `"approved"`, the church does not exist to members. This predictability is what makes the machine trustworthy.
+
+## What This Looks Like with Supabase
+
+In production the status field becomes a PostgreSQL enum, and Row Level Security replaces the JavaScript filters:
+
+```sql
+-- Members can only see approved churches
+create policy "approved churches are public"
+  on churches for select
+  using (status = 'approved');
+
+-- Churches can only see their own record
+create policy "churches see themselves"
+  on churches for select
+  using (auth.uid() = id);
+```
+
+The state machine doesn't change. The transitions don't change. The admin UI doesn't change. The only thing that changes is where the enforcement happens — from JavaScript in the client to PostgreSQL on the server. Both are right. One is more secure.
+
+Getting the state machine right at the prototype stage means the production migration is a policy translation, not a rethink.

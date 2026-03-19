@@ -1,0 +1,144 @@
+---
+title: "Building an Audio Sermon Player in React Native Without expo-av"
+description: "How Faith Fellows implements a native-feeling audio playback UI for sermons and worship music using only React Native primitives and state — ready for expo-av integration."
+date: "2026-03-19"
+tags: ["react-native", "audio", "expo", "ui"]
+---
+
+Most developers building an audio player for the first time make the same mistake: they reach for `expo-av` on day one, spend two hours configuring audio sessions, hit a simulator limitation, then spend another hour debugging why playback works on device but not in development. By the time they get sound working, they haven't thought about the UI at all. The scrub bar is an afterthought. The time display is wrong. The mini player doesn't exist.
+
+There's a better sequence. Build the entire player UI first — scrub bar, play/pause, elapsed time, mini player — using only local state and a fake timer. Get the interaction model exactly right. Then drop `expo-av` in and replace the fake timer with real callbacks. The UI never changes. The integration becomes a one-afternoon job instead of a week-long debug session.
+
+This is how Faith Fellows ships a fully functional sermon player today, with zero native audio, ready for real audio the moment it's needed.
+
+## The Post Detail Screen
+
+`app/(user)/post-detail.tsx` receives a post ID via route params, finds the post in context, and renders the player conditionally based on the `audio` flag:
+
+```tsx
+const { id } = useLocalSearchParams();
+const post = posts.find((p) => p.id === id);
+
+return (
+  <ScrollView>
+    <PostHeader post={post} />
+    <Text style={s.body}>{post.body}</Text>
+    {post.audio && <AudioPlayer duration={post.duration} />}
+  </ScrollView>
+);
+```
+
+Non-audio posts (devotionals, announcements) just render the header and body. Audio posts get the player below the content. Clean, conditional, obvious.
+
+## Simulating Playback
+
+The player manages three pieces of local state — playing status, a 0–1 progress ratio, and elapsed seconds:
+
+```tsx
+const [playing, setPlaying] = useState(false);
+const [progress, setProgress] = useState(0);      // 0–1
+const [elapsed, setElapsed] = useState(0);         // seconds
+```
+
+When `playing` is true, a `useEffect` fires an interval that increments elapsed every second, calculates the new progress ratio, and stops automatically at the end of the track:
+
+```tsx
+useEffect(() => {
+  if (!playing) return;
+  const id = setInterval(() => {
+    setElapsed((e) => {
+      const next = e + 1;
+      if (next >= totalSeconds) {
+        setPlaying(false);
+        return 0;
+      }
+      setProgress(next / totalSeconds);
+      return next;
+    });
+  }, 1000);
+  return () => clearInterval(id);
+}, [playing, totalSeconds]);
+```
+
+Here's the thing: this is structurally identical to the callback you get from `expo-av`'s `onPlaybackStatusUpdate`. Both give you position and duration. Both tell you when playback ends. When real audio arrives, this interval gets replaced with an `Audio.Sound` setup — the state it drives doesn't change at all.
+
+## The Scrub Bar
+
+Rather than pulling in a slider library, the scrub bar is built from a `View` with an absolute-positioned fill and a `PanResponder` that converts touch position to a 0–1 ratio:
+
+```tsx
+const barRef = useRef<View>(null);
+
+const panResponder = PanResponder.create({
+  onStartShouldSetPanResponder: () => true,
+  onPanResponderMove: (evt) => {
+    barRef.current?.measure((x, y, width) => {
+      const ratio = Math.max(0, Math.min(1, evt.nativeEvent.pageX / width));
+      setProgress(ratio);
+      setElapsed(Math.floor(ratio * totalSeconds));
+    });
+  },
+});
+```
+
+The fill width is `${progress * 100}%`. When the user drags, `progress` and `elapsed` update reactively, the fill moves, and the time display updates. The whole thing is about 30 lines, it handles edge clamping, and it works identically with simulated or real audio.
+
+## Time Display
+
+Duration strings from the `Post` model are stored as `"MM:SS"`. A small utility converts elapsed seconds to the same format:
+
+```ts
+const formatTime = (seconds: number) => {
+  const m = Math.floor(seconds / 60).toString().padStart(2, "0");
+  const s = (seconds % 60).toString().padStart(2, "0");
+  return `${m}:${s}`;
+};
+```
+
+The player shows `{formatTime(elapsed)} / {post.duration}` below the scrub bar. It ticks every second. It handles the wrap-around at the end of the track. Nothing fancy — but getting this right is the difference between a player that feels native and one that feels hacked together.
+
+## Mini Player
+
+When a user taps play and then scrolls back to the feed, the full player scrolls off screen. Faith Fellows solves this with a mini player bar that persists at the bottom of the feed while audio is playing.
+
+A `playingPost` value in `AppContext` tracks what's currently playing. When it's non-null, any screen that reads context can render the mini player:
+
+```tsx
+// In any screen
+const { playingPost } = useAppContext();
+
+return (
+  <View style={{ flex: 1 }}>
+    <FeedList />
+    {playingPost && <MiniPlayer post={playingPost} />}
+  </View>
+);
+```
+
+The mini player shows the post title, church name, and a play/pause toggle. It doesn't need to know about the scrub bar or elapsed time — it just controls `playing` state through context. The full player and the mini player share the same state, so they stay in sync without any coordination layer.
+
+## Swapping in expo-av
+
+When real audio files are available, the `setInterval` in `AudioPlayer` gets replaced with this:
+
+```tsx
+const sound = useRef<Audio.Sound>();
+
+const load = async (uri: string) => {
+  const { sound: s } = await Audio.Sound.createAsync(
+    { uri },
+    { shouldPlay: false },
+    (status) => {
+      if (status.isLoaded) {
+        setProgress(status.positionMillis / status.durationMillis);
+        setElapsed(Math.floor(status.positionMillis / 1000));
+      }
+    }
+  );
+  sound.current = s;
+};
+```
+
+The callback sets `progress` and `elapsed` — exactly what the interval was doing. The scrub bar reacts. The time display updates. The mini player reflects the current state. Every piece of UI you built works untouched, because you built it against state, not against a specific audio implementation.
+
+That's the payoff of doing the UI first.

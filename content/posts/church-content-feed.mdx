@@ -1,0 +1,123 @@
+---
+title: "Building a Multi-Type Content Feed for a Church Platform"
+description: "How Faith Fellows renders sermons, announcements, devotionals, music, and events in a unified feed with type-specific UI treatments and filterable tabs."
+date: "2026-03-19"
+tags: ["react-native", "ui", "feed", "content"]
+---
+
+A church isn't a Twitter account. The content a church publishes is genuinely varied in a way that most platforms aren't — a 45-minute sermon audio, a one-line service time change, a weekly devotional, a new worship song. These things have nothing in common except that they came from the same organization. Shoving them all into the same `Post` interface and rendering them with the same card component will either produce a UI that feels wrong for every type, or a component so conditional it becomes unmaintainable.
+
+Faith Fellows solves this with a flat data model, a type badge system, and a single `PostCard` that knows how to read the type and adapt. Here's how it's built — and why the flat model beats a discriminated union when you're headed toward Supabase.
+
+## One Interface, Five Types
+
+Faith Fellows defines five post types:
+
+```ts
+type PostType = "sermon" | "announcement" | "devotional" | "music" | "audio";
+```
+
+Every post shares a common base, then adds optional fields for type-specific data:
+
+```ts
+interface Post {
+  id: string;
+  cId: string;           // churchId
+  type: PostType;
+  title: string;
+  body: string;
+  ts: number;
+  likes: number;
+  views: number;
+  // Sermon-specific
+  speaker?: string;
+  audio?: boolean;
+  duration?: string;     // "MM:SS"
+  plays?: number;
+  // Music-specific
+  artist?: string;
+  album?: string;
+  // Devotional-specific
+  author?: string;
+  // Scheduling
+  scheduled: boolean;
+}
+```
+
+The temptation is to model this as a discriminated union — `SermonPost | AnnouncementPost | DevotionalPost` — so TypeScript narrows the type correctly at every access site. Resist it. A discriminated union means five interfaces to maintain, five cases everywhere you render a post, and a schema migration nightmare when this hits a real database. Optional fields with a `type` discriminant is flat, queryable, and maps to a single `posts` table with nullable columns. TypeScript still narrows correctly anywhere you check `post.type`. You get most of the safety without the complexity.
+
+## Filtering Without a Backend
+
+The home feed needs to let users filter by type. The state is minimal:
+
+```tsx
+const [filter, setFilter] = useState<PostType | "all">("all");
+
+const filtered = posts.filter(
+  (p) => filter === "all" || p.type === filter
+);
+```
+
+The filter tabs are driven by a config array, so adding a new post type is a one-line change:
+
+```tsx
+const FILTERS = [
+  { key: "all", label: "All" },
+  { key: "sermon", label: "Sermons" },
+  { key: "announcement", label: "Updates" },
+  { key: "devotional", label: "Devotionals" },
+  { key: "music", label: "Music" },
+];
+```
+
+Rendered from an array, mounted from a config. New type → update the array → done. The layout never changes.
+
+## PostCard: One Component, Smart Rendering
+
+`PostCard` receives any `Post` and adapts its output based on `post.type`. The type badge colour is the simplest example of the pattern — a lookup object instead of a chain of conditionals:
+
+```tsx
+const TYPE_COLORS: Record<PostType, string> = {
+  sermon: "#6B4C9A",
+  announcement: "#3A7CA5",
+  devotional: "#2E8B7A",
+  music: "#C73E5A",
+  audio: "#D4853A",
+};
+```
+
+Pass in the type, get out a colour. No `if/else`. No switch. The same pattern applies to icons, labels, and the secondary content row. Sermons and music get an audio indicator with duration and play count. Devotionals get an author attribution line. Announcements render their full body inline — announcements are usually short and time-sensitive, so users shouldn't have to tap through to read them.
+
+The key discipline here: `PostCard` renders. It doesn't fetch, it doesn't navigate, it doesn't own state. It takes a `Post` and a handful of callbacks and produces UI. This keeps it testable and reusable across the feed, the church profile page, and the bookmarks screen.
+
+## Announcements Live in a Carousel
+
+Announcements are special. A Sunday service time change or an event cancellation shouldn't compete with a 45-minute sermon in the feed — it'll get buried. Faith Fellows promotes announcements into a horizontal carousel above the feed:
+
+```tsx
+const announcements = posts.filter((p) => p.type === "announcement");
+const feedPosts = posts.filter((p) => p.type !== "announcement");
+```
+
+The carousel is a `ScrollView` with `horizontal` and no third-party carousel library. Auto-advance is handled by a `useEffect` with `setInterval` that increments a ref-tracked index and calls `scrollTo` on the view. It's about 20 lines of code and it covers the 90% case cleanly.
+
+Time-sensitive content gets prime real estate. Everything else flows through the main feed. The hierarchy is built into the data split, not into a bunch of conditional rendering inside a single component.
+
+## Church Recommendations Before the Feed
+
+Below the carousel, before the feed proper, the home screen inserts a horizontal row of churches the current user doesn't follow yet. This is computed entirely from existing state:
+
+```tsx
+const recommended = churches
+  .filter((c) => c.status === "approved")
+  .filter((c) => !user.following.includes(c.id))
+  .slice(0, 10);
+```
+
+When the user taps Follow, `user.following` updates in context and that church's posts begin appearing in the feed immediately — because the feed itself filters by `user.following` before rendering. No refetch. No loading state. The recommendation row is also the discovery mechanism, and following is instant.
+
+## Where This Goes at Scale
+
+Right now all of this runs on in-memory arrays, filtered on every render. At seed-data scale this is imperceptible. At real-user scale, the feed query needs to move to the backend — a Supabase RPC function that joins `posts` with the user's `follows` rows, returning an already-filtered result set.
+
+The component API doesn't change. `PostCard` still takes a `Post`. The filter tabs still set a `filter` string. The data just arrives from a network call instead of an array filter. This is the benefit of keeping the data model flat and the component layer thin — the migration is a data-source swap, not a rewrite.

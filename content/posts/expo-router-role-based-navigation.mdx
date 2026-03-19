@@ -1,0 +1,142 @@
+---
+title: "Role-Based Navigation in Expo Router Without a Navigation Library"
+description: "How Faith Fellows uses Expo Router's file-system routing and layout guards to enforce role-based access across three portals — no React Navigation config required."
+date: "2026-03-19"
+tags: ["expo-router", "navigation", "react-native", "auth"]
+---
+
+Here's a situation every React Native developer has lived through: you have two types of users — say, a regular member and a church admin — and they need completely different navigation structures. One gets a home feed and a profile tab. The other gets a dashboard, a content creation flow, and an analytics screen. Nothing overlaps.
+
+The React Navigation solution looks something like this: a root-level switch navigator that reads auth state and conditionally renders either the member stack or the admin stack. Sounds reasonable. Then you add a third role. Then deep linking breaks. Then your auth state lives half in context and half in navigation params and half in AsyncStorage and you're not sure which is source of truth. Then someone asks for a church-pending state and you realize the navigator switch can't express it cleanly.
+
+Faith Fellows has three portals — member, church, super admin — each with its own tab bar, its own screen set, and its own auth rules. Zero React Navigation. Here's how Expo Router makes this trivial.
+
+## The File System Is the Architecture
+
+Expo Router turns your `app/` directory into your navigation tree. Files are routes. Folders are segments. The key primitive is the **route group** — a folder wrapped in parentheses that nests screens together without adding anything to the URL path.
+
+```
+app/
+  (auth)/
+    user-login.tsx
+    church-login.tsx
+  (user)/
+    _layout.tsx        ← auth guard
+    (tabs)/
+      home.tsx
+      discover.tsx
+  (church)/
+    _layout.tsx        ← auth guard
+    (tabs)/
+      dashboard.tsx
+      services.tsx
+  (admin)/
+    _layout.tsx        ← auth guard
+    (tabs)/
+      sa-dashboard.tsx
+```
+
+Three portals. Three route groups. Each completely isolated from the others. Adding a new role means adding a new folder — nothing else changes.
+
+## The Layout Guard
+
+Every portal's `_layout.tsx` runs before any child route renders. That's the hook. Read auth state there, and you have a single, unavoidable checkpoint that controls the entire portal:
+
+```tsx
+// app/(user)/_layout.tsx
+import { Redirect, Slot } from "expo-router";
+import { useAppContext } from "../../src/context/AppContext";
+
+export default function UserLayout() {
+  const { authed } = useAppContext();
+
+  if (!authed || authed.role !== "user") {
+    return <Redirect href="/(auth)/user-login" />;
+  }
+
+  return <Slot />;
+}
+```
+
+That's the whole guard. If the auth check fails, `<Redirect />` fires before a single child pixel renders — no loading flicker, no flash of protected content, no conditional rendering gymnastics scattered across screens. `<Slot />` renders whichever child route is currently active.
+
+The church and admin portals have identical guards, just checking for their respective roles. The logic is always in one place, always runs first, and is impossible to accidentally bypass by navigating directly to a deep link.
+
+## Per-Role Tab Bars
+
+Each portal's `(tabs)/_layout.tsx` defines a completely different tab bar. The church portal gets a dashboard and a content creation tab. The member portal gets a home feed and a discover tab. They share no configuration:
+
+```tsx
+// app/(church)/(tabs)/_layout.tsx
+import { Tabs } from "expo-router";
+import { Ionicons } from "@expo/vector-icons";
+
+export default function ChurchTabs() {
+  return (
+    <Tabs screenOptions={{ tabBarActiveTintColor: "#E63946" }}>
+      <Tabs.Screen
+        name="dashboard"
+        options={{
+          title: "Dashboard",
+          tabBarIcon: ({ color }) => (
+            <Ionicons name="grid-outline" size={22} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="services"
+        options={{
+          title: "Create",
+          tabBarIcon: ({ color }) => (
+            <Ionicons name="add-circle-outline" size={22} color={color} />
+          ),
+        }}
+      />
+    </Tabs>
+  );
+}
+```
+
+The member portal has different screen names, different icons, different tab count. They coexist without interference because they live in separate route groups.
+
+## Post-Login Routing
+
+After a successful login, the screen navigates using `router.replace()` — not `router.push()`. This is non-negotiable:
+
+```tsx
+// app/(auth)/user-login.tsx
+const handleLogin = () => {
+  const u = users.find((x) => x.email === email && x.pw === pw);
+  if (!u) return Alert.alert("Error", "Invalid credentials");
+
+  login({ id: u.id, name: u.name, role: "user", ... });
+  router.replace("/(user)/(tabs)/home");
+};
+```
+
+`replace()` removes the login screen from the history stack. If you use `push()` instead, pressing back on the home screen returns to login — which is both a UX bug and a security smell. Replace it, erase it, move on.
+
+## The Index Gate
+
+`app/index.tsx` is the first thing the app renders on cold start. It reads auth state and immediately redirects to the right portal:
+
+```tsx
+export default function Index() {
+  const { authed } = useAppContext();
+
+  if (!authed) return <Redirect href="/(auth)/user-login" />;
+  if (authed.role === "church") return <Redirect href="/(church)/(tabs)/dashboard" />;
+  if (authed.role === "super") return <Redirect href="/(admin)/(tabs)/sa-dashboard" />;
+  return <Redirect href="/(user)/(tabs)/home" />;
+}
+```
+
+Cold start, background refresh, forced logout — the app always wakes up in the right place. No imperative navigation calls. No startup logic spread across components. The index is a pure router: it reads state and points the user somewhere. That's all it does.
+
+## Why It Scales
+
+When Faith Fellows eventually needs a fourth role — say, a worship team coordinator with a subset of the church portal's screens — the work is: create `(coordinator)/`, add a `_layout.tsx` guard, add a `(tabs)/` config, add a case to `index.tsx`. The three existing portals don't change at all. Not one line.
+
+This is the underrated superpower of file-system routing. The architecture enforces separation by default. You can't accidentally let a member render a church admin screen, because member screens don't exist anywhere in the `(church)` route group. The folder structure itself is the access control layer.
+
+When the mental model is this clean, building new features stops feeling like threading a needle and starts feeling like adding a shelf.

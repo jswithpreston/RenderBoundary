@@ -1,0 +1,224 @@
+---
+title: "Migrating Faith Fellows from React Context to Supabase"
+description: "A step-by-step guide to replacing the in-memory AppContext with a real Supabase backend — schema design, auth integration, and data fetching patterns."
+date: "2026-03-19"
+tags: ["supabase", "react-native", "backend", "auth"]
+---
+
+Prototyping in-memory is one of the best decisions you can make early in a project. No migration scripts, no API rate limits, no auth tokens to juggle — just `useState`, some seed data, and a clear head to focus on product decisions. Faith Fellows was built this way entirely: churches, users, posts, follows, and likes all living as arrays in a single React Context.
+
+Then the prototype worked. Real users wanted to use it. And suddenly `useState` holding arrays became the thing standing between you and a real product.
+
+This is the migration plan: how to replace every piece of `AppContext` with Supabase without taking the app down between steps, without rewriting the component layer, and without losing your mind in the process.
+
+## Schema Design: Flatten the Relationships
+
+The TypeScript interfaces map to PostgreSQL tables almost one-for-one, with one key transformation: arrays embedded in objects become junction tables.
+
+In the prototype, a user has `following: string[]` and `likes: Set<string>`. In Postgres, those are rows in `follows` and `likes` tables. This isn't just a database convention — it's what makes the data queryable, scalable, and safe to update concurrently.
+
+```sql
+-- Core tables
+create table churches (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  denom text,
+  pastor text,
+  avatar text,
+  members integer default 0,
+  bio text,
+  location text,
+  region text,
+  email text unique not null,
+  status text default 'pending' check (status in ('pending', 'approved', 'rejected')),
+  cover text,
+  created_at timestamptz default now()
+);
+
+create table posts (
+  id uuid primary key default gen_random_uuid(),
+  church_id uuid references churches(id) on delete cascade,
+  type text not null check (type in ('sermon', 'announcement', 'devotional', 'music', 'audio')),
+  title text not null,
+  body text,
+  speaker text,
+  author text,
+  artist text,
+  album text,
+  duration text,
+  audio boolean default false,
+  plays integer default 0,
+  likes integer default 0,
+  views integer default 0,
+  scheduled boolean default false,
+  publish_at timestamptz,
+  created_at timestamptz default now()
+);
+
+-- Junction tables
+create table follows (
+  user_id uuid references auth.users(id) on delete cascade,
+  church_id uuid references churches(id) on delete cascade,
+  primary key (user_id, church_id)
+);
+
+create table likes (
+  user_id uuid references auth.users(id) on delete cascade,
+  post_id uuid references posts(id) on delete cascade,
+  primary key (user_id, post_id)
+);
+
+create table bookmarks (
+  user_id uuid references auth.users(id) on delete cascade,
+  post_id uuid references posts(id) on delete cascade,
+  primary key (user_id, post_id)
+);
+```
+
+The `check` constraints on `status` and `type` do the same job as the TypeScript union types — they enforce the valid values at the database level. Your app logic stays the same. The database just becomes the second line of enforcement.
+
+## Auth First
+
+Everything downstream depends on knowing who the user is, so auth is step one. Install the client:
+
+```bash
+npx expo install @supabase/supabase-js @react-native-async-storage/async-storage
+```
+
+Create a singleton in `src/lib/supabase.ts`:
+
+```ts
+import { createClient } from "@supabase/supabase-js";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export const supabase = createClient(
+  process.env.EXPO_PUBLIC_SUPABASE_URL!,
+  process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY!,
+  {
+    auth: {
+      storage: AsyncStorage,
+      autoRefreshToken: true,
+      persistSession: true,
+    },
+  }
+);
+```
+
+`AsyncStorage` replaces the in-memory session. `autoRefreshToken` means users don't get logged out silently. `persistSession` means closing and reopening the app doesn't require re-login.
+
+The login handler becomes a single call:
+
+```tsx
+const handleLogin = async () => {
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email,
+    password: pw,
+  });
+  if (error) return Alert.alert("Error", error.message);
+  router.replace("/(user)/(tabs)/home");
+};
+```
+
+The mock `login()` function in AppContext is gone. Auth state now comes from `supabase.auth.getSession()` and the `onAuthStateChange` listener.
+
+## Replacing Data Fetching
+
+Each in-memory array becomes a custom hook that fetches from Supabase. Here's churches:
+
+```ts
+// src/hooks/useChurches.ts
+import { useEffect, useState } from "react";
+import { supabase } from "../lib/supabase";
+import type { Church } from "../types";
+
+export function useChurches() {
+  const [churches, setChurches] = useState<Church[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    supabase
+      .from("churches")
+      .select("*")
+      .eq("status", "approved")
+      .order("created_at", { ascending: false })
+      .then(({ data }) => {
+        if (data) setChurches(data);
+        setLoading(false);
+      });
+  }, []);
+
+  return { churches, loading };
+}
+```
+
+The hook returns the same shape as the AppContext array. Screens that currently destructure `const { churches } = useAppContext()` can switch to `const { churches } = useChurches()` with no other changes. This is the reward for designing the component layer to be data-source agnostic.
+
+## Mutations: Where the Real Work Is
+
+Reads are straightforward. Mutations are where you have to think carefully, because the prototype mutated local state and that was instant — Supabase mutations are async and can fail.
+
+Here's `toggleLike`, which in the prototype was a `Set.add` or `Set.delete`:
+
+```ts
+const toggleLike = async (postId: string) => {
+  const userId = (await supabase.auth.getUser()).data.user?.id;
+  if (!userId) return;
+
+  const already = likes.has(postId);
+
+  if (already) {
+    await supabase
+      .from("likes")
+      .delete()
+      .match({ user_id: userId, post_id: postId });
+    setLikes((prev) => { const s = new Set(prev); s.delete(postId); return s; });
+  } else {
+    await supabase
+      .from("likes")
+      .insert({ user_id: userId, post_id: postId });
+    setLikes((prev) => new Set(prev).add(postId));
+  }
+};
+```
+
+Notice the optimistic update pattern: local state updates immediately (so the UI responds instantly), and the Supabase call happens in the background. If the call fails, you'd roll back. For likes and bookmarks, silent failure is acceptable in a first version — a missed like is not a critical error. For follows and post publishing, you'd want explicit error handling.
+
+The component calling `toggleLike` doesn't change at all. The abstraction holds.
+
+## Locking It Down with Row Level Security
+
+Every application-level filter (`churches.filter(c => c.status === "approved")`) has a database equivalent. RLS policies enforce these at the PostgreSQL level — so even if someone calls the Supabase API directly with the anon key, they still can't see pending churches or another user's bookmarks:
+
+```sql
+-- Only approved churches are visible to the public
+create policy "public approved churches"
+  on churches for select using (status = 'approved');
+
+-- Only church owners can update their own record
+create policy "church owners update"
+  on churches for update using (auth.uid() = id);
+
+-- Users can only manage their own follows
+create policy "own follows"
+  on follows for all using (auth.uid() = user_id);
+```
+
+These policies don't replace the application filters — they back them up. Defense in depth.
+
+## The Migration Order
+
+Do this in steps, and keep the app working at every step:
+
+1. Set up Supabase project and run the schema migrations
+2. Integrate auth — login, signup, session persistence, `onAuthStateChange`
+3. Replace `churches` array with `useChurches()` hook
+4. Replace `posts` array with a live feed query filtered by follows
+5. Migrate `toggleLike`, `toggleBookmark`, `followChurch` to async mutations
+6. Migrate `publishPost`, `deletePost` for the church portal
+7. Migrate `approveChurch`, `rejectChurch` for the admin portal
+8. Add Supabase Storage for audio files and church cover photos
+9. Add Supabase Realtime for the notification feed
+
+Each step is independently shippable. After step 2, real users can log in. After step 4, the feed is live. By step 9, AppContext is a thin shell around Supabase calls — and then you can delete most of it.
+
+The prototype wasn't throwaway code. It was a spec written in TypeScript.
